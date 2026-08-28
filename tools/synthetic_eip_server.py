@@ -41,6 +41,15 @@ FORWARD_OPEN_REPLY = FORWARD_OPEN | 0x80
 FORWARD_CLOSE = 0x4E
 FORWARD_CLOSE_REPLY = FORWARD_CLOSE | 0x80
 
+UNCONNECTED_SEND = 0x52
+
+# Rockwell custom: enumerate instances of the Symbol Object (class 0x6B).
+GET_INSTANCE_ATTRIBUTE_LIST = 0x55
+GET_INSTANCE_ATTRIBUTE_LIST_REPLY = GET_INSTANCE_ATTRIBUTE_LIST | 0x80
+
+# Symbol Object class code.
+SYMBOL_CLASS = 0x6B
+
 # Fixed session handle handed out on RegisterSession (any non-zero value).
 SESSION_HANDLE = 0x13572468
 
@@ -70,14 +79,14 @@ TAGS = {
     "TestBool": (0xC1, struct.pack("<B", 1)),
     "TestInt": (0xC3, struct.pack("<h", -123)),
     "TestString": (0xD0, struct.pack("<I", 11) + b"Hello World"),
-    # Read by the LanInventory example (run-switch status).
-    "ControllerInfo.Mode": (0xC4, struct.pack("<i", 1)),  # DINT, mode = 1 (RUN)
+    # A DINT tag (mode = 1 = RUN); enumerated by the ListTags demo.
+    "ControllerInfo.Mode": (0xC4, struct.pack("<i", 1)),
 }
 
 
 def parse_symbolic_path(path):
-    """Extract the tag name from a symbolic (0xA0) path segment, or None."""
-    if len(path) < 2 or path[0] != 0xA0:
+    """Extract the tag name from a symbolic (0x91) path segment, or None."""
+    if len(path) < 2 or path[0] != 0x91:
         return None
     name_len = path[1]
     return path[2:2 + name_len].decode("ascii", "replace")
@@ -114,6 +123,106 @@ def handle_unregister_session(conn, context):
     print("  -> UnregisterSession response")
 
 
+def _parse_instance_from_path(path):
+    """Parse a Symbol Object path (class 0x6B + instance segment) and return the
+    starting instance number. Handles 8/16/32-bit logical instance segments."""
+    if len(path) < 2 or path[0] != 0x20 or path[1] != SYMBOL_CLASS:
+        return None
+    if len(path) < 4:
+        return None
+    seg = path[2]
+    if seg == 0x24 and len(path) >= 4:
+        return path[3]
+    if seg == 0x25 and len(path) >= 5:
+        return struct.unpack("<H", path[3:5])[0]
+    if seg == 0x26 and len(path) >= 7:
+        return struct.unpack("<I", path[3:7])[0]
+    return None
+
+
+def _handle_get_instance_attribute_list(start, rest):
+    """Synthesize a Symbol Object (0x6B) instance list from the TAGS table."""
+    if rest is None or len(rest) < 2:
+        attr_ids = [1, 2]
+    else:
+        count = struct.unpack("<H", rest[0:2])[0]
+        attr_ids = list(struct.unpack("<" + "H" * count, rest[2:2 + count * 2]))
+    records = b""
+    returned = 0
+    for idx, (name, (type_code, _value)) in enumerate(TAGS.items(), start=1):
+        if idx < (start or 0):
+            continue
+        record = struct.pack("<I", idx)
+        for attr in attr_ids:
+            if attr == 1:  # Symbol Name (Logix STRING: 4-byte length + bytes)
+                record += struct.pack("<I", len(name)) + name.encode("ascii")
+            elif attr == 2:  # Symbol Type (UINT): atomic scalar, type code in low byte
+                record += struct.pack("<H", type_code & 0xFF)
+            else:
+                record += struct.pack("<I", 0)
+        records += record
+        returned += 1
+    print(f"  -> Symbol instance list: start={start} attrs={attr_ids} -> {returned} symbol(s)")
+    # status 0 = success (no paging for the tiny synthetic table).
+    return bytes([GET_INSTANCE_ATTRIBUTE_LIST_REPLY, 0, 0, 0]) + records
+
+
+def handle_cip_request(session, service, path, rest):
+    """Dispatch a CIP request and return the response bytes (reply service ...)."""
+    if service == GET_INSTANCE_ATTRIBUTE_LIST:
+        start = _parse_instance_from_path(path)
+        if start is not None:
+            return _handle_get_instance_attribute_list(start, rest)
+    if service == GET_ATTRIBUTE_SINGLE and len(path) >= 6 and path[:4] == bytes([0x20, 0x01, 0x24, 0x01]):
+        # Identity object Get_Attribute_Single: the attribute segment
+        # (0x30 <attr>) is the final word of the 3-word request path, matching
+        # the wire format real ControlLogix hardware expects.
+        if path[4] == 0x30:
+            attr = path[5]
+            value = IDENTITY_ATTRIBUTES.get(attr)
+            if value is None:
+                print(f"  -> Identity attr {attr}: unknown")
+                return bytes([GET_ATTRIBUTE_SINGLE_REPLY, 0, 0x09, 0])  # invalid attribute
+            print(f"  -> Identity attr {attr}: {value.hex()}")
+            return bytes([GET_ATTRIBUTE_SINGLE_REPLY, 0, 0, 0]) + value
+        print("  -> Identity: bad attribute segment")
+        return bytes([GET_ATTRIBUTE_SINGLE_REPLY, 0, 0x05, 0])  # path unknown
+    if service == READ_TAG:
+        name = parse_symbolic_path(path)
+        entry = TAGS.get(name)
+        if entry is not None:
+            type_code, value = entry
+            print(f"  -> Read Tag {name}: type=0x{type_code:02X} data={value.hex()}")
+            return bytes([READ_TAG_REPLY, 0, 0, 0]) + struct.pack("<H", type_code) + value
+        print(f"  -> Read Tag {name}: not found")
+        return bytes([READ_TAG_REPLY, 0, 0x04, 0])  # path segment error
+    if service == WRITE_TAG:
+        name = parse_symbolic_path(path)
+        if len(rest) >= 4:
+            type_code = struct.unpack("<H", rest[2:4])[0]
+            value = rest[4:]
+            TAGS[name] = (type_code & 0xFF, value)
+            print(f"  -> Write Tag {name}: type=0x{type_code:04X} data={value.hex()}")
+            return bytes([WRITE_TAG_REPLY, 0, 0, 0])
+        print(f"  -> Write Tag {name}: bad request")
+        return bytes([WRITE_TAG_REPLY, 0, 0x04, 0])
+    if service == FORWARD_OPEN:
+        # rest = [priority/tick (1)][timeout ticks (1)][O->T conn ID (4)][T->O conn ID (4)][...]
+        if len(rest) >= 6:
+            ot = struct.unpack("<I", rest[2:6])[0]
+            to = 0x10203040
+            connections[session] = {"ot": ot, "to": to}
+            print(f"  -> Forward Open: O->T=0x{ot:08X} T->O=0x{to:08X}")
+            return bytes([FORWARD_OPEN_REPLY, 0, 0, 0]) + struct.pack("<IIHH", ot, to, 1, 0x0001)
+        print("  -> Forward Open: bad request")
+        return bytes([FORWARD_OPEN_REPLY, 0, 0x04, 0])
+    if service == FORWARD_CLOSE:
+        print("  -> Forward Close")
+        return bytes([FORWARD_CLOSE_REPLY, 0, 0, 0])
+    print(f"  -> unsupported service 0x{service:02X}")
+    return bytes([service | 0x80, 0, 0x08, 0])  # service not supported
+
+
 def handle_send_rr_data(conn, session, context, body):
     # Body: interface handle (4), timeout (2), item count (2), CPF items.
     if len(body) < 8:
@@ -144,59 +253,27 @@ def handle_send_rr_data(conn, session, context, body):
 
     print(f"  -> SendRRData: service=0x{service:02X} path={path.hex()} data={rest.hex()}")
 
-    if service == GET_ATTRIBUTE_SINGLE and path == bytes([0x20, 0x01, 0x24, 0x01]):
-        # Identity object Get_Attribute_Single: rest = [0x30, attribute].
-        if len(rest) >= 2 and rest[0] == 0x30:
-            attr = rest[1]
-            value = IDENTITY_ATTRIBUTES.get(attr)
-            if value is None:
-                cip_resp = bytes([GET_ATTRIBUTE_SINGLE_REPLY, 0, 0x09, 0])  # invalid attribute
-                print(f"  -> Identity attr {attr}: unknown")
-            else:
-                cip_resp = bytes([GET_ATTRIBUTE_SINGLE_REPLY, 0, 0, 0]) + value
-                print(f"  -> Identity attr {attr}: {value.hex()}")
-        else:
-            cip_resp = bytes([GET_ATTRIBUTE_SINGLE_REPLY, 0, 0x05, 0])  # path unknown
-            print("  -> Identity: bad attribute segment")
-    elif service == READ_TAG:
-        name = parse_symbolic_path(path)
-        entry = TAGS.get(name)
-        if entry is not None:
-            type_code, value = entry
-            cip_resp = bytes([READ_TAG_REPLY, 0, 0, 0]) + struct.pack("<H", type_code) + value
-            print(f"  -> Read Tag {name}: type=0x{type_code:02X} data={value.hex()}")
-        else:
-            cip_resp = bytes([READ_TAG_REPLY, 0, 0x04, 0])  # path segment error
-            print(f"  -> Read Tag {name}: not found")
-    elif service == WRITE_TAG:
-        name = parse_symbolic_path(path)
-        if len(rest) >= 4:
-            elem_count = struct.unpack("<H", rest[0:2])[0]
-            type_code = struct.unpack("<H", rest[2:4])[0]
-            value = rest[4:]
-            TAGS[name] = (type_code & 0xFF, value)
-            cip_resp = bytes([WRITE_TAG_REPLY, 0, 0, 0])
-            print(f"  -> Write Tag {name}: type=0x{type_code:04X} data={value.hex()}")
-        else:
-            cip_resp = bytes([WRITE_TAG_REPLY, 0, 0x04, 0])
-            print(f"  -> Write Tag {name}: bad request")
-    elif service == FORWARD_OPEN:
-        # rest = [priority/tick (1)][timeout ticks (1)][O->T conn ID (4)][T->O conn ID (4)][...]
-        if len(rest) >= 6:
-            ot = struct.unpack("<I", rest[2:6])[0]
-            to = 0x10203040
-            connections[session] = {"ot": ot, "to": to}
-            cip_resp = bytes([FORWARD_OPEN_REPLY, 0, 0, 0]) + struct.pack("<IIHH", ot, to, 1, 0x0001)
-            print(f"  -> Forward Open: O->T=0x{ot:08X} T->O=0x{to:08X}")
-        else:
-            cip_resp = bytes([FORWARD_OPEN_REPLY, 0, 0x04, 0])
-            print("  -> Forward Open: bad request")
-    elif service == FORWARD_CLOSE:
-        cip_resp = bytes([FORWARD_CLOSE_REPLY, 0, 0, 0])
-        print("  -> Forward Close")
+    if service == UNCONNECTED_SEND:
+        # Unconnected Send (0x52): rest = priority(1) + timeout(1) + length(2)
+        # + embedded request + pad + route path(4). Logix returns the embedded
+        # response directly (no 0xD2 wrapper).
+        if len(rest) < 4:
+            print("  -> Unconnected Send: body too short")
+            return
+        msg_len = struct.unpack("<H", rest[2:4])[0]
+        embedded = rest[4:4 + msg_len]
+        if len(embedded) < 2:
+            print("  -> Unconnected Send: bad embedded request")
+            return
+        emb_service = embedded[0]
+        emb_path_words = embedded[1]
+        emb_path = embedded[2:2 + emb_path_words * 2]
+        emb_rest = embedded[2 + emb_path_words * 2:]
+        slot = rest[-1] if len(rest) >= 4 + msg_len + 4 else 0
+        print(f"  -> Unconnected Send: slot={slot} service=0x{emb_service:02X} path={emb_path.hex()}")
+        cip_resp = handle_cip_request(session, emb_service, emb_path, emb_rest)
     else:
-        cip_resp = bytes([GET_ATTRIBUTE_SINGLE_REPLY, 0, 0x08, 0])  # service not supported
-        print("  -> SendRRData: unsupported service/path")
+        cip_resp = handle_cip_request(session, service, path, rest)
 
     # Build the SendRRData response body.
     resp_body = struct.pack("<IHH", 0, 0, 2)                          # iface handle, timeout, item count
