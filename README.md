@@ -1,10 +1,18 @@
 # ESP32ControlLogix - Native EtherNet/IP + CIP Client for ControlLogix
 
 > [!CAUTION]
-> _DO NOT USE THIS LIBRARY IN PRODUCTION._  This library is currently not working and is under active development. It has only been validated against the
-> synthetic EtherNet/IP server found in /tools.
+> _DO NOT USE THIS LIBRARY IN PRODUCTION._  This library is under active development and has not been thoroughly tested.
 
 A lightweight, non-blocking EtherNet/IP and CIP (Common Industrial Protocol) client for the ESP32, purpose-built to talk to Allen-Bradley/Rockwell ControlLogix and compatible Logix controllers. No external dependencies, bounded memory, and a simple API.
+
+## To-do
+
+Not yet validated against real ControlLogix hardware (or not implemented):
+
+- **Symbolic tag read/write** — Unconnected `Tag`/`PlcClient` path (`Read Tag`/`Write Tag`) and the connected `Connection` path (`Forward Open`/`SendUnitData`)
+- **Backplane routing for tag I/O** — tag reads/writes do not yet route through the backplane to the CPU (slot 0); only `ExplicitMessage::sendRouted()` (used by the IdentityQuery, LanInventory, and ListTags examples) does.
+- **Program-scoped tags** — `ListTags` enumerates controller-scope tags only; `Program:`-prefixed access is currently unsupported.
+- **Arrays, structs, and user-defined types** — not supported/decoded.
 
 ## Table of Contents
 
@@ -38,6 +46,7 @@ A lightweight, non-blocking EtherNet/IP and CIP (Common Industrial Protocol) cli
 - **Bounded Memory** : Fixed-size tag pool and reusable packet buffers.
 - **Single In-Flight Operation** : One tag read/write at a time. `read()`/`write()` return `Busy` while another operation is in flight, so the shared connection is never contended.
 - **Native Protocol Stack** : EtherNet/IP encapsulation, CIP explicit messaging, connected (Forward Open / SendUnitData) and unconnected (SendRRData) messaging.
+- **Backplane Routing** : Route CIP requests through the ControlLogix backplane to the CPU (slot 0) or any module (slots 1..16) via a Connection Manager "Unconnected Send".
 - **Symbolic Logix Tags** : Read and write symbolic tags with typed accessors for scalars, arrays, and strings.
 - **Callbacks** : Optional tag-completion and connection-state callbacks for event-driven integration.
 - **Reconnect & Recovery** : Handles timeouts, disconnects, stale responses, and PLC restarts.
@@ -242,13 +251,23 @@ class Connection {
 
 One CIP explicit-message exchange (SendRRData / unconnected messaging). The `data()` pointer is valid until the next `send()`.
 
+`sendRouted()` wraps the request in a Connection Manager "Unconnected Send" (0x52) and routes it through the backplane to `slot` (0 = CPU, 1..16 = other modules). Use it to reach the CPU when connected through a ControlLogix Ethernet module, whose own Identity object lives at class 1/instance 1.
+
 ```cpp
 class ExplicitMessage {
-    static constexpr size_t kMaxCipData = 256;
+    static constexpr size_t kMaxCipData     = 256;
+    static constexpr size_t kRoutedOverhead = 15;
 
     Status send(TcpConnection &conn, uint32_t sessionHandle, uint8_t service,
                 const uint8_t *path, size_t pathLen,
                 const uint8_t *data, size_t dataLen, uint32_t timeoutMs);
+
+    // Backplane-routed send: wraps the request in a Connection Manager
+    // "Unconnected Send" (0x52) with a route path to `slot` (0..16).
+    Status sendRouted(TcpConnection &conn, uint32_t sessionHandle, uint8_t slot,
+                      uint8_t service, const uint8_t *path, size_t pathLen,
+                      const uint8_t *data, size_t dataLen, uint32_t timeoutMs);
+
     Status poll();
     void   abort();
 
@@ -347,10 +366,13 @@ size_t appendClass(uint8_t *out, uint8_t classId);        // 8-bit class segment
 size_t appendInstance(uint8_t *out, uint8_t instanceId);  // 8-bit instance segment
 size_t appendAttribute(uint8_t *out, uint8_t attributeId); // 8-bit attribute segment
 size_t appendSymbolic(uint8_t *out, const char *name);   // symbolic tag segment
+size_t appendBackplaneRoute(uint8_t *out, uint8_t slot); // backplane route (port 1, link = slot)
 
 size_t      dataTypeElementSize(DataType t);
 const char *dataTypeName(DataType t);
 ```
+
+Connection Manager constants are also exposed: `kConnectionManagerClass` (0x06) and `kUnconnectedSend` (0x52).
 
 Little-endian encode/decode helpers (`putU16`, `putU32`, `putU64`, `getU16`, `getU32`, `getU64`) and the `EncapsulationHeader` struct with `encodeHeader()`/`decodeHeader()` are also available for advanced use.
 
@@ -388,19 +410,16 @@ The tag pool size (`PlcClient::kMaxTags`) defaults to 8. To change it, define `E
 
 ## Examples
 
-The `examples/` directory contains progressively lower-level demos:
+The `examples/` directory contains demos of the protocol stack:
 
 | Example | Description |
 |---------|-------------|
-| `PlcClientDemo` | Top-level `PlcClient` API: connect, read-modify-write of a DINT tag. |
-| `TagReadWrite` | Unconnected `Tag` read/write for DINT, REAL, and STRING tags. |
-| `ConnectedTagReadWrite` | Connected messaging (`Connection`): Forward Open -> Read -> Write -> Verify -> Forward Close. |
+| `EipSession` | Register/unregister an EtherNet/IP `Session`. |
 | `IdentityQuery` | CIP Identity Object `Get_Attribute_Single` queries via `ExplicitMessage`. |
-| `EipSession` | EtherNet/IP `Session` register/unregister. |
-| `LanInventory` | LAN inventory scan. |
-| `ReliabilityDemo` | Reconnect, abort, and resource-stress behavior. |
+| `LanInventory` | Scan the subnet for EtherNet/IP devices; report hardware, firmware, device state, and run-switch status. |
+| `ListTags` | Enumerate controller-scope tags via the Symbol Object (`Get Instance Attribute List`, `0x55`). |
 
-Each example can point at a real ControlLogix PLC or at the host-side synthetic server (`tools/synthetic_eip_server.py`).
+Each example can point at a real ControlLogix PLC or at the host-side synthetic server (`tools/synthetic_eip_server.py`). The symbolic tag read/write and connected-messaging demos were removed pending validation of backplane-routed tag access against real hardware.
 
 ## Architecture
 
@@ -481,5 +500,7 @@ plc.read(handles[0], 5000);   // start the first; the callback chains the rest
 
 ## Version History
 
+- **0.1.3** : Fix the symbolic tag segment encoding (`0x91` "extended symbol" vs. `0xA0` "constructed data type") and the `Get Attribute Single` request (the attribute is a path segment, keeping the path-size word correct); add Symbol Object (class `0x6B`) tag enumeration via `Get Instance Attribute List` (`0x55`) with `kSymbolClass`, symbol attribute IDs, and `appendInstance16`/`appendInstance32` helpers; enlarge the explicit-message buffer to accept a full 502-byte UCMM response; add the `ListTags` example and correct `LanInventory` run-switch/state reporting.
+- **0.1.2** : Add backplane routing (`ExplicitMessage::sendRouted()`) to reach the CPU (slot 0) or other modules when connected through a ControlLogix Ethernet module; add `appendBackplaneRoute()`, `kConnectionManagerClass`, and `kUnconnectedSend` CIP helpers; align the SendRRData timeout field with the reference implementation.
 - **0.1.1** : Enforce a single in-flight tag operation (`read()`/`write()` return `Busy` while another is active); `Tag` now takes a shared, caller-supplied `ExplicitMessage`
 - **0.1.0** : Initial release.
