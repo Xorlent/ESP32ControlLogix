@@ -1,4 +1,5 @@
 #include "ExplicitMessage.h"
+#include "Cip.h"
 
 #include <Arduino.h>
 #include <string.h>
@@ -26,7 +27,6 @@ Status ExplicitMessage::send(TcpConnection &conn, uint32_t sessionHandle, uint8_
     if (!conn.connected()) {
         return Status::NotReady;
     }
-    conn_ = &conn;
 
     // CIP request = service (1) + path size in words (1) + path + data.
     const size_t cipLen = 2 + pathLen + dataLen;
@@ -34,6 +34,65 @@ Status ExplicitMessage::send(TcpConnection &conn, uint32_t sessionHandle, uint8_
         (pathLen > 0 && path == nullptr) || (dataLen > 0 && data == nullptr)) {
         return Status::InvalidArg;
     }
+
+    return startSend(conn, sessionHandle, service, path, pathLen, data, dataLen, timeoutMs);
+}
+
+Status ExplicitMessage::sendRouted(TcpConnection &conn, uint32_t sessionHandle, uint8_t slot,
+                                   uint8_t service, const uint8_t *path, size_t pathLen,
+                                   const uint8_t *data, size_t dataLen, uint32_t timeoutMs) {
+    if (state_ == State::Sending || state_ == State::Receiving) {
+        return Status::Busy;
+    }
+    if (!conn.connected()) {
+        return Status::NotReady;
+    }
+    if (slot > 16) {  // 17-slot 1756 chassis (slots 0..16)
+        return Status::InvalidArg;
+    }
+
+    // Embedded request = service (1) + path size (1) + path + data.
+    const size_t embeddedLen = 2 + pathLen + dataLen;
+    if (embeddedLen > kMaxCipData || (pathLen & 1) != 0 ||
+        (pathLen > 0 && path == nullptr) || (dataLen > 0 && data == nullptr)) {
+        return Status::InvalidArg;
+    }
+
+    // Build the Unconnected Send (0x52) request data:
+    //   priority(1) + timeout(1) + length(2) + embedded request + pad + route(4).
+    uint8_t wrapper[kRoutedOverhead + kMaxCipData];
+    size_t w = 0;
+    wrapper[w++] = 0x0A;                        // priority/tick time
+    wrapper[w++] = 0x05;                        // timeout ticks
+    putU16(wrapper + w, uint16_t(embeddedLen)); // embedded message length
+    w += 2;
+    wrapper[w++] = service;                     // embedded service
+    wrapper[w++] = uint8_t(pathLen / 2);        // embedded path size (words)
+    if (pathLen) {
+        memcpy(wrapper + w, path, pathLen);
+        w += pathLen;
+    }
+    if (dataLen) {
+        memcpy(wrapper + w, data, dataLen);
+        w += dataLen;
+    }
+    if (embeddedLen & 1) {
+        wrapper[w++] = 0x00;                    // pad to a whole 16-bit word
+    }
+    w += appendBackplaneRoute(wrapper + w, slot);  // route: port 1 = backplane, link = slot
+
+    // Connection Manager path (class 6, instance 1).
+    const uint8_t cmPath[4] = {0x20, kConnectionManagerClass, 0x24, 0x01};
+
+    return startSend(conn, sessionHandle, kUnconnectedSend, cmPath, sizeof(cmPath),
+                     wrapper, w, timeoutMs);
+}
+
+Status ExplicitMessage::startSend(TcpConnection &conn, uint32_t sessionHandle, uint8_t service,
+                                  const uint8_t *path, size_t pathLen,
+                                  const uint8_t *data, size_t dataLen, uint32_t timeoutMs) {
+    const size_t cipLen = 2 + pathLen + dataLen;
+    conn_ = &conn;
 
     // Encapsulation header.
     EncapsulationHeader h;
@@ -48,7 +107,7 @@ Status ExplicitMessage::send(TcpConnection &conn, uint32_t sessionHandle, uint8_
     // Body: interface handle, timeout, CPF item count, two CPF items.
     uint8_t *body = tx_ + kEncapsulationHeaderSize;
     putU32(body, 0);                          // interface handle
-    putU16(body + 4, 0);                      // timeout
+    putU16(body + 4, 10);                     // timeout (ticks)
     putU16(body + 6, 2);                      // CPF item count = 2
     putU16(body + 8, 0x0000);                 // item 1: null address type
     putU16(body + 10, 0);                     // item 1: length 0
@@ -134,7 +193,7 @@ Status ExplicitMessage::readResponse() {
             rxLen_ += size_t(n);
             if (rxLen_ == kEncapsulationHeaderSize) {
                 EncapsulationHeader h = decodeHeader(rx_);
-                if (h.length > 16 + kMaxCipData) {
+                if (h.length > 16 + kMaxCipData + kRoutedOverhead) {
                     return Status::Error;  // oversized / malformed packet
                 }
                 rxExpected_ = kEncapsulationHeaderSize + h.length;

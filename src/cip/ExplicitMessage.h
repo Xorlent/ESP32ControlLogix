@@ -19,8 +19,16 @@ class TcpConnection;
  */
 class ExplicitMessage {
 public:
-    // Maximum CIP request/response payload (service + path + data).
-    static constexpr size_t kMaxCipData = 256;
+    // Maximum CIP request/response payload (service + path + data). Sized to
+    // accept a full unconnected-message (UCMM) response of up to 502 bytes, so
+    // bulk enumeration (e.g. the Symbol Object's Get Instance Attribute List)
+    // can page through a whole batch in one response.
+    static constexpr size_t kMaxCipData = 512;
+
+    // Extra bytes a backplane-routed (Unconnected Send) request adds beyond the
+    // embedded request: Unconnected Send service/path (6) + priority/timeout/
+    // length (4) + pad (1) + route path (4) = 15 bytes.
+    static constexpr size_t kRoutedOverhead = 15;
 
     ExplicitMessage() = default;
     ~ExplicitMessage();
@@ -29,12 +37,25 @@ public:
     ExplicitMessage &operator=(const ExplicitMessage &) = delete;
 
     // Start a SendRRData exchange. conn must be connected; sessionHandle is the
-    // registered session handle. path is the encoded CIP path (segment bytes,
-    // whole 16-bit words); data is optional service-specific data appended
-    // after the path (e.g. an attribute segment).
+    // registered session handle. path is the encoded CIP request path (segment
+    // bytes, whole 16-bit words) and must include every path segment the
+    // service requires -- e.g. for Get Attribute Single the class, instance,
+    // and attribute segments are all part of the path. data is genuine
+    // service-specific data appended after the path (e.g. the element count of
+    // a Logix Read/Write Tag); it is NOT part of the path and is not counted
+    // in the path-size word.
     Status send(TcpConnection &conn, uint32_t sessionHandle, uint8_t service,
                 const uint8_t *path, size_t pathLen,
                 const uint8_t *data, size_t dataLen, uint32_t timeoutMs);
+
+    // Start a SendRRData exchange routed through the backplane to `slot`
+    // (0..16). The request is wrapped in a Connection Manager "Unconnected Send"
+    // (0x52) with a route path (port 1 = backplane, link = slot). Use this to
+    // reach the CPU (slot 0) when connected to a ControlLogix Ethernet module,
+    // whose own Identity object lives at class 1/instance 1.
+    Status sendRouted(TcpConnection &conn, uint32_t sessionHandle, uint8_t slot,
+                      uint8_t service, const uint8_t *path, size_t pathLen,
+                      const uint8_t *data, size_t dataLen, uint32_t timeoutMs);
 
     // Advance the exchange. Returns Pending while in flight, Ok once the
     // response is received and framed, or an error Status.
@@ -65,12 +86,12 @@ private:
     uint64_t sentContext_ = 0;
 
     // Transmit buffer: header + body (interface handle/timeout/items + CIP).
-    uint8_t tx_[kEncapsulationHeaderSize + 16 + kMaxCipData];
+    uint8_t tx_[kEncapsulationHeaderSize + 16 + kMaxCipData + kRoutedOverhead];
     size_t txLen_ = 0;
     size_t txSent_ = 0;
 
     // Receive buffer: header + body.
-    uint8_t rx_[kEncapsulationHeaderSize + 16 + kMaxCipData];
+    uint8_t rx_[kEncapsulationHeaderSize + 16 + kMaxCipData + kRoutedOverhead];
     size_t rxLen_ = 0;
     size_t rxExpected_ = 0;
 
@@ -80,6 +101,9 @@ private:
     const uint8_t *data_ = nullptr;
     size_t dataLen_ = 0;
 
+    Status startSend(TcpConnection &conn, uint32_t sessionHandle, uint8_t service,
+                     const uint8_t *path, size_t pathLen,
+                     const uint8_t *data, size_t dataLen, uint32_t timeoutMs);
     Status writePending();
     Status readResponse();
     Status parseResponse();

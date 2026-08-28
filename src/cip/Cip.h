@@ -34,6 +34,9 @@ enum class Service : uint8_t {
     SetMember = 0x19,
     InsertMember = 0x1A,
     RemoveMember = 0x1B,
+    // Rockwell custom: enumerate the instances (and selected attribute values)
+    // of an object such as the Logix Symbol Object (class 0x6B).
+    GetInstanceAttributeList = 0x55,
 };
 
 // CIP path segment type codes (encoded in the high 3 bits of the first byte).
@@ -46,7 +49,26 @@ enum : uint8_t {
     kSegmentElementId16 = 0x29,   // 16-bit element ID
     kSegmentAttributeId8 = 0x30,  // 8-bit attribute ID
     kSegmentAttributeId16 = 0x31, // 16-bit attribute ID
-    kSegmentSymbolic = 0xA0,      // ANSI extended symbol segment
+    kSegmentInstanceId32 = 0x26,  // 32-bit instance ID
+    kSegmentSymbolic = 0x91,      // extended symbol segment (data segment, 1-byte length)
+};
+
+// CIP Connection Manager object (class 0x06).
+constexpr uint8_t kConnectionManagerClass = 0x06;
+
+// Connection Manager "Unconnected Send" service. (0x52 is also "Read Tag
+// Fragmented" in the Logix tag-service context; here it routes an embedded
+// request through the Connection Manager to another module.)
+constexpr uint8_t kUnconnectedSend = 0x52;
+
+// CIP Symbol Object (class 0x6B) - the Logix tag database.
+constexpr uint8_t kSymbolClass = 0x6B;
+
+// Symbol Object (class 0x6B) instance attribute IDs.
+enum : uint8_t {
+    kSymbolName = 1,    // Logix STRING (4-byte length + characters)
+    kSymbolType = 2,    // UINT (struct flag / dimensions / elementary type code)
+    kSymbolAddress = 3, // UDINT
 };
 
 // CIP general status codes (CIP Vol 1, Appendix B).
@@ -116,6 +138,26 @@ inline size_t appendInstance(uint8_t *out, uint8_t instanceId) {
     return 2;
 }
 
+// Append a 16-bit instance segment (padded to a whole word); returns 4.
+inline size_t appendInstance16(uint8_t *out, uint16_t instanceId) {
+    out[0] = kSegmentInstanceId16;
+    out[1] = uint8_t(instanceId);
+    out[2] = uint8_t(instanceId >> 8);
+    out[3] = 0x00;  // pad the odd segment to a whole 16-bit word
+    return 4;
+}
+
+// Append a 32-bit instance segment (padded to a whole word); returns 6.
+inline size_t appendInstance32(uint8_t *out, uint32_t instanceId) {
+    out[0] = kSegmentInstanceId32;
+    out[1] = uint8_t(instanceId);
+    out[2] = uint8_t(instanceId >> 8);
+    out[3] = uint8_t(instanceId >> 16);
+    out[4] = uint8_t(instanceId >> 24);
+    out[5] = 0x00;  // pad the odd segment to a whole 16-bit word
+    return 6;
+}
+
 // Append an 8-bit attribute segment; returns bytes written (2).
 inline size_t appendAttribute(uint8_t *out, uint8_t attributeId) {
     out[0] = kSegmentAttributeId8;
@@ -127,8 +169,8 @@ inline size_t appendAttribute(uint8_t *out, uint8_t attributeId) {
 // + name + optional pad) always fits in the library's 128-byte path buffers.
 constexpr size_t kMaxSymbolicName = 120;
 
-// Encode a symbolic (0xA0) segment for a tag name into out.
-// Returns bytes written (including any pad byte to a whole word).
+// Encode a symbolic (0x91, "extended symbol" data segment) segment for a tag
+// name into out. Returns bytes written (including any pad byte to a whole word).
 // The name is capped to kMaxSymbolicName to keep the output bounded.
 inline size_t appendSymbolic(uint8_t *out, const char *name) {
     size_t len = strlen(name);
@@ -144,6 +186,16 @@ inline size_t appendSymbolic(uint8_t *out, const char *name) {
         ++total;
     }
     return total;
+}
+
+// Append a backplane route path (port 1 = backplane, link = slot) as a
+// PADDED_EPATH: length(1 word) + pad + port + link. Returns bytes written (4).
+inline size_t appendBackplaneRoute(uint8_t *out, uint8_t slot) {
+    out[0] = 0x01;  // path length = 1 word
+    out[1] = 0x00;  // pad byte
+    out[2] = 0x01;  // port 1 = backplane
+    out[3] = slot;  // link address = slot number
+    return 4;
 }
 
 // CIP elementary data type codes (Logix Read/Write Tag services).
