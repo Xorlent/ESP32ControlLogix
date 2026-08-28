@@ -18,7 +18,7 @@
 
 #define ESP32_CONTROLLOGIX_VERSION_MAJOR 0
 #define ESP32_CONTROLLOGIX_VERSION_MINOR 1
-#define ESP32_CONTROLLOGIX_VERSION_PATCH 1
+#define ESP32_CONTROLLOGIX_VERSION_PATCH 3
 
 #include "transport/Status.h"
 #include "transport/Client.h"

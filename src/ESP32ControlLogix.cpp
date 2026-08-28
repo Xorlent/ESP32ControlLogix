@@ -3,7 +3,7 @@
 namespace clx {
 
 const char *version() {
-    return "0.1.1";
+    return "0.1.3";
 }
 
 }  // namespace clx
