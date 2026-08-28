@@ -95,17 +95,21 @@ void setup() {
 
 // Build the Identity path (class 1, instance 1) and start a query.
 clx::Status startQuery(uint8_t attr) {
-    uint8_t path[4];
+    // Get Attribute Single path = class + instance + attribute (3 words). The
+    // attribute segment is a path segment, not service data, so it must be
+    // appended to the path for the path-size word to be correct.
+    uint8_t path[6];
     size_t pl = 0;
-    pl += clx::appendClass(path + pl, 1);      // class = Identity (1)
-    pl += clx::appendInstance(path + pl, 1);   // instance = 1
+    pl += clx::appendClass(path + pl, 1);          // class = Identity (1)
+    pl += clx::appendInstance(path + pl, 1);       // instance = 1
+    pl += clx::appendAttribute(path + pl, attr);   // attribute segment
 
-    uint8_t data[2];
-    clx::appendAttribute(data, attr);          // attribute segment
-
-    return msg.send(conn, session.handle(),
-                    static_cast<uint8_t>(clx::Service::GetAttributeSingle),
-                    path, pl, data, sizeof(data), MESSAGE_TIMEOUT_MS);
+    // Route through the backplane to the CPU (slot 0). When connected to a
+    // ControlLogix Ethernet module, the Identity object at class 1/instance 1
+    // belongs to the module itself; the CPU's identity lives in slot 0.
+    return msg.sendRouted(conn, session.handle(), 0,
+                          static_cast<uint8_t>(clx::Service::GetAttributeSingle),
+                          path, pl, nullptr, 0, MESSAGE_TIMEOUT_MS);
 }
 
 void printResult(const Query &q) {
