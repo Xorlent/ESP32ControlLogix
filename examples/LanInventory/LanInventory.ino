@@ -13,12 +13,18 @@
  *   1. registers an EtherNet/IP session;
  *   2. reads the CIP Identity Object (vendor, device type, product code,
  *      firmware revision, status, serial, product name, state);
- *   3. reads the symbolic tag ControllerInfo.Mode (run-switch status);
- *   4. prints the results and closes the session.
+ *   3. derives the run-switch position from the Identity status word
+ *      (low byte = keyswitch, high byte = remote) rather than a tag;
+ *   4. reads the device state from the ListIdentity (UDP) response, since the
+ *      Identity State attribute (attr 8) is not exposed by Get Attribute Single;
+ *   5. prints the results and closes the session.
  *
  */
 
 #include <ESP32ControlLogix.h>
+
+#include <lwip/inet.h>
+#include <lwip/sockets.h>
 
 const IPAddress LOCAL_IP(192, 168, 1, 50);
 const IPAddress LOCAL_GATEWAY(192, 168, 1, 1);
@@ -39,7 +45,6 @@ clx::Client::Config cfg;
 clx::TcpConnection tcp;
 clx::Session session;
 clx::ExplicitMessage msg;
-clx::Tag tag;
 
 struct Identity {
     uint16_t vendor = 0;
@@ -50,7 +55,7 @@ struct Identity {
     uint16_t status = 0;
     uint32_t serial = 0;
     char productName[64] = {};
-    uint8_t state = 0;
+    uint8_t state = 0xFF;  // 0xFF = unknown (Identity attr 8 is best-effort)
 };
 
 const uint8_t kIdentityAttrs[] = {
@@ -70,7 +75,7 @@ IPAddress network;      // network address (e.g. 192.168.1.0)
 IPAddress broadcast;    // broadcast address (e.g. 192.168.1.255)
 IPAddress currentIp;    // current probe target
 int found = 0;
-int queryIndex = 0;     // 0..7 = identity attr, 8 = mode
+int queryIndex = 0;     // index into kIdentityAttrs[]
 bool stepStarted = false;
 Identity id;
 
@@ -88,13 +93,20 @@ const char *identityState(uint8_t state) {
     }
 }
 
-const char *modeName(int32_t mode) {
-    switch (mode) {
-        case 0: return "PROGRAM";
-        case 1: return "RUN";
-        case 2: return "TEST/REMOTE";
-        default: return "UNKNOWN";
-    }
+// Identity status word keyswitch encodings (low byte = mode, high byte = remote).
+const uint8_t KEYSWITCH_RUN      = 0x60;
+const uint8_t KEYSWITCH_PROG     = 0x70;
+const uint8_t KEYSWITCH_REMOTE_0 = 0x30;
+const uint8_t KEYSWITCH_REMOTE_1 = 0x31;
+
+// Derive the run-switch (keyswitch) text from the Identity status word.
+const char *keyswitchName(uint16_t statusWord) {
+    uint8_t s0 = statusWord & 0xFF;          // keyswitch mode byte
+    uint8_t s1 = (statusWord >> 8) & 0xFF;   // remote/other byte
+    bool remote = (s1 == KEYSWITCH_REMOTE_0 || s1 == KEYSWITCH_REMOTE_1);
+    if (s0 == KEYSWITCH_RUN)  return remote ? "REMOTE RUN"  : "RUN";
+    if (s0 == KEYSWITCH_PROG) return remote ? "REMOTE PROG" : "PROG";
+    return "UNKNOWN";
 }
 
 // Advance an IPv4 address to the next host address (increments the last octet,
@@ -108,6 +120,76 @@ bool nextHost(IPAddress &ip) {
         ip[i] = 0;
     }
     return false;
+}
+
+// Query the device "state" via the ListIdentity (0x0063) message over UDP.
+// Many Logix CPUs do not expose the Identity object's State attribute (attr 8)
+// to a Get Attribute Single read, but the ListIdentity response always carries
+// a one-byte state field after the product name. Returns the state, or 0xFF if
+// no valid response arrives within the bounded wait.
+uint8_t queryListIdentityState(const IPAddress &ip) {
+    int fd = lwip_socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (fd < 0) return 0xFF;
+
+    struct timeval tv;
+    tv.tv_sec = 0;
+    tv.tv_usec = 500000;  // ~500 ms bounded wait
+    lwip_setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+    // Bind the EtherNet/IP UDP port so the reply is routed back to us.
+    sockaddr_in local{};
+    local.sin_family = AF_INET;
+    local.sin_port = htons(44818);
+    local.sin_addr.s_addr = 0;  // INADDR_ANY
+    if (lwip_bind(fd, reinterpret_cast<sockaddr *>(&local), sizeof(local)) < 0) {
+        lwip_close(fd);
+        return 0xFF;
+    }
+
+    // ListIdentity request: 24-byte header, command 0x0063, no body.
+    clx::EncapsulationHeader h;
+    h.command = static_cast<uint16_t>(clx::Command::ListIdentity);
+    uint8_t req[clx::kEncapsulationHeaderSize];
+    clx::encodeHeader(req, h);
+
+    sockaddr_in dst{};
+    dst.sin_family = AF_INET;
+    dst.sin_port = htons(44818);
+    dst.sin_addr.s_addr = ip;  // IPAddress converts to network byte order
+
+    lwip_sendto(fd, req, sizeof(req), 0, reinterpret_cast<sockaddr *>(&dst), sizeof(dst));
+
+    uint8_t state = 0xFF;
+    uint8_t buf[512];
+    sockaddr_in from{};
+    socklen_t fromLen = sizeof(from);
+    int n = lwip_recvfrom(fd, buf, sizeof(buf), 0, reinterpret_cast<sockaddr *>(&from), &fromLen);
+
+    // Layout: 24-byte header + item count (2) then items. Each item is
+    // type(2) + length(2) + data(...). The Identity item's data lays out:
+    //  ...zero(8) IP@6 vendor@18 devType@20 prodCode@22 rev@24 status@26
+    //  serial@28 nameLen@32 name@33 state@(33+nameLen)
+    if (n >= 26 &&
+        clx::decodeHeader(buf).command == static_cast<uint16_t>(clx::Command::ListIdentity)) {
+        uint16_t itemCount = clx::getU16(buf + 24);
+        int off = 26;
+        for (uint16_t i = 0; i < itemCount && off + 4 <= n; ++i) {
+            uint16_t type = clx::getU16(buf + off);
+            uint16_t ilen = clx::getU16(buf + off + 2);
+            off += 4;
+            if (off + ilen > n) break;
+            if (type == 0x000C && ilen >= 33) {  // Identity item (0x0C)
+                uint8_t nameLen = buf[off + 32];
+                if (33 + nameLen < ilen) {
+                    state = buf[off + 33 + nameLen];
+                }
+            }
+            off += ilen;
+        }
+    }
+
+    lwip_close(fd);
+    return state;
 }
 
 void setup() {
@@ -147,26 +229,27 @@ void setup() {
 }
 
 void startQuery() {
-    clx::Status st;
-    if (queryIndex < int(kIdentityAttrCount)) {
-        uint8_t attr = kIdentityAttrs[queryIndex];
-        uint8_t path[4];
-        size_t pl = 0;
-        pl += clx::appendClass(path + pl, 1);      // class = Identity (1)
-        pl += clx::appendInstance(path + pl, 1);   // instance = 1
-        uint8_t data[2];
-        clx::appendAttribute(data, attr);
-        st = msg.send(tcp, session.handle(),
-                      static_cast<uint8_t>(clx::Service::GetAttributeSingle),
-                      path, pl, data, sizeof(data), MESSAGE_TIMEOUT_MS);
-    } else {
-        st = tag.read(msg, tcp, session.handle(), "ControllerInfo.Mode", 1, MESSAGE_TIMEOUT_MS);
-    }
+    uint8_t attr = kIdentityAttrs[queryIndex];
+    // Get Attribute Single path = class + instance + attribute (3 words). The
+    // attribute is a path segment, not service data, so appending it to the
+    // path keeps the path-size word correct.
+    uint8_t path[6];
+    size_t pl = 0;
+    pl += clx::appendClass(path + pl, 1);          // class = Identity (1)
+    pl += clx::appendInstance(path + pl, 1);       // instance = 1
+    pl += clx::appendAttribute(path + pl, attr);   // attribute segment
+    // Route through the backplane to the CPU (slot 0). When connected to a
+    // ControlLogix Ethernet module, the Identity object at class 1/instance 1
+    // belongs to the module itself; the CPU's identity lives in slot 0.
+    clx::Status st = msg.sendRouted(tcp, session.handle(), 0,
+                                    static_cast<uint8_t>(clx::Service::GetAttributeSingle),
+                                    path, pl, nullptr, 0, MESSAGE_TIMEOUT_MS);
     stepStarted = (st == clx::Status::Pending);
 }
 
 void finishQuery() {
-    if (queryIndex < int(kIdentityAttrCount)) {
+    // A failed attribute read leaves the field at its default (state stays 0xFF).
+    if (queryIndex < int(kIdentityAttrCount) && msg.resultCode() == 0) {
         uint8_t attr = kIdentityAttrs[queryIndex];
         const uint8_t *d = msg.data();
         size_t n = msg.dataLength();
@@ -185,7 +268,12 @@ void finishQuery() {
     }
     ++queryIndex;
     stepStarted = false;
-    if (queryIndex > int(kIdentityAttrCount)) {
+    if (queryIndex >= int(kIdentityAttrCount)) {
+        // The Identity State attribute (attr 8) is often not exposed by Get
+        // Attribute Single on Logix CPUs; fall back to the ListIdentity (UDP)
+        // response, which always carries the one-byte state field.
+        uint8_t st = queryListIdentityState(currentIp);
+        if (st != 0xFF) id.state = st;
         printDevice();
         session.close();
         phase = Phase::Close;
@@ -201,12 +289,7 @@ void printDevice() {
     Serial.printf("  Firmware: %u.%u\n", id.revMajor, id.revMinor);
     Serial.printf("  Identity status: 0x%04X\n", id.status);
     Serial.printf("  Device state: %u (%s)\n", id.state, identityState(id.state));
-    if (tag.dataLength() >= 4) {
-        int32_t mode = clx::getU32(tag.data());
-        Serial.printf("  RUN switch: %s (%ld)\n", modeName(mode), (long)mode);
-    } else {
-        Serial.printf("  RUN switch: unavailable (CIP 0x%02X)\n", tag.resultCode());
-    }
+    Serial.printf("  RUN switch: %s\n", keyswitchName(id.status));
 }
 
 void loop() {
@@ -282,23 +365,14 @@ void loop() {
             if (!stepStarted) {
                 startQuery();
             } else {
-                // Poll whichever query is in flight (identity or mode).
-                bool isMode = (queryIndex >= int(kIdentityAttrCount));
-                clx::Status st = isMode ? tag.poll(msg) : msg.poll();
+                clx::Status st = msg.poll();
                 if (st == clx::Status::Ok) {
                     finishQuery();
                 } else if (st == clx::Status::Timeout || st == clx::Status::Error || st == clx::Status::Closed) {
-                    if (isMode) {
-                        // The mode tag is optional (non-Logix devices lack it);
-                        // report the device with the result code instead of
-                        // dropping it.
-                        finishQuery();
-                    } else {
-                        // Identity query failed; skip to the next device.
-                        session.abort();
-                        tcp.close();
-                        phase = Phase::Scan;
-                    }
+                    // Identity query failed; skip to the next device.
+                    session.abort();
+                    tcp.close();
+                    phase = Phase::Scan;
                 }
             }
             break;
