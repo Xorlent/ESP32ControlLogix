@@ -35,13 +35,16 @@ public:
     Tag &operator=(const Tag &) = delete;
 
     // Start a Read Tag for the named tag (elementCount elements). msg is the
-    // shared message that carries the exchange.
+    // shared message that carries the exchange. cpuSlot routes the request
+    // through the backplane to that CPU slot (kNoRoute = direct).
     Status read(ExplicitMessage &msg, TcpConnection &conn, uint32_t sessionHandle,
-                const char *name, uint32_t elementCount, uint32_t timeoutMs);
+                const char *name, uint32_t elementCount, uint32_t timeoutMs,
+                uint8_t cpuSlot = kNoRoute);
 
     // Start a Write Tag for the named tag using the current data buffer.
     Status write(ExplicitMessage &msg, TcpConnection &conn, uint32_t sessionHandle,
-                 const char *name, uint32_t elementCount, uint32_t timeoutMs);
+                 const char *name, uint32_t elementCount, uint32_t timeoutMs,
+                 uint8_t cpuSlot = kNoRoute);
 
     // Advance the current read/write using the shared message.
     Status poll(ExplicitMessage &msg);
@@ -110,9 +113,11 @@ private:
     uint8_t resultCode_ = 0;
 
     Status startRead(ExplicitMessage &msg, TcpConnection &conn, uint32_t sessionHandle,
-                     const char *name, uint32_t elementCount, uint32_t timeoutMs);
+                     const char *name, uint32_t elementCount, uint32_t timeoutMs,
+                     uint8_t cpuSlot);
     Status startWrite(ExplicitMessage &msg, TcpConnection &conn, uint32_t sessionHandle,
-                      const char *name, uint32_t elementCount, uint32_t timeoutMs);
+                      const char *name, uint32_t elementCount, uint32_t timeoutMs,
+                      uint8_t cpuSlot);
 
     // True if [off, off+size) lies within the data buffer.
     bool inBounds(size_t off, size_t size) const;

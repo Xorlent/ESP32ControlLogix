@@ -12,18 +12,18 @@ Tag::~Tag() {
 }
 
 Status Tag::read(ExplicitMessage &msg, TcpConnection &conn, uint32_t sessionHandle,
-                 const char *name, uint32_t elementCount, uint32_t timeoutMs) {
+                 const char *name, uint32_t elementCount, uint32_t timeoutMs, uint8_t cpuSlot) {
     if (name == nullptr || strlen(name) > kMaxSymbolicName) {
         return Status::InvalidArg;
     }
     if (state_ == State::Reading || state_ == State::Writing) {
         return Status::Busy;
     }
-    return startRead(msg, conn, sessionHandle, name, elementCount, timeoutMs);
+    return startRead(msg, conn, sessionHandle, name, elementCount, timeoutMs, cpuSlot);
 }
 
 Status Tag::write(ExplicitMessage &msg, TcpConnection &conn, uint32_t sessionHandle,
-                  const char *name, uint32_t elementCount, uint32_t timeoutMs) {
+                  const char *name, uint32_t elementCount, uint32_t timeoutMs, uint8_t cpuSlot) {
     if (name == nullptr || strlen(name) > kMaxSymbolicName) {
         return Status::InvalidArg;
     }
@@ -33,20 +33,25 @@ Status Tag::write(ExplicitMessage &msg, TcpConnection &conn, uint32_t sessionHan
     if (state_ == State::Reading || state_ == State::Writing) {
         return Status::Busy;
     }
-    return startWrite(msg, conn, sessionHandle, name, elementCount, timeoutMs);
+    return startWrite(msg, conn, sessionHandle, name, elementCount, timeoutMs, cpuSlot);
 }
 
 Status Tag::startRead(ExplicitMessage &msg, TcpConnection &conn, uint32_t sessionHandle,
-                      const char *name, uint32_t elementCount, uint32_t timeoutMs) {
+                      const char *name, uint32_t elementCount, uint32_t timeoutMs, uint8_t cpuSlot) {
     uint8_t path[128];
     size_t pathLen = appendSymbolic(path, name);
 
     uint8_t count[2];
     putU16(count, uint16_t(elementCount));
 
-    Status st = msg.send(conn, sessionHandle,
-                         static_cast<uint8_t>(TagService::Read),
-                         path, pathLen, count, sizeof(count), timeoutMs);
+    Status st;
+    if (cpuSlot == kNoRoute) {
+        st = msg.send(conn, sessionHandle, static_cast<uint8_t>(TagService::Read),
+                      path, pathLen, count, sizeof(count), timeoutMs);
+    } else {
+        st = msg.sendRouted(conn, sessionHandle, cpuSlot, static_cast<uint8_t>(TagService::Read),
+                            path, pathLen, count, sizeof(count), timeoutMs);
+    }
     if (st != Status::Pending) {
         return st;
     }
@@ -59,7 +64,7 @@ Status Tag::startRead(ExplicitMessage &msg, TcpConnection &conn, uint32_t sessio
 }
 
 Status Tag::startWrite(ExplicitMessage &msg, TcpConnection &conn, uint32_t sessionHandle,
-                       const char *name, uint32_t elementCount, uint32_t timeoutMs) {
+                       const char *name, uint32_t elementCount, uint32_t timeoutMs, uint8_t cpuSlot) {
     // Determine and validate the data length from the data type + element count.
     size_t dataLen;
     if (dataType_ == static_cast<uint8_t>(DataType::String)) {
@@ -87,9 +92,14 @@ Status Tag::startWrite(ExplicitMessage &msg, TcpConnection &conn, uint32_t sessi
     memcpy(wdata + 4, data_, dataLen);
     size_t wdataLen = 4 + dataLen;
 
-    Status st = msg.send(conn, sessionHandle,
-                         static_cast<uint8_t>(TagService::Write),
-                         path, pathLen, wdata, wdataLen, timeoutMs);
+    Status st;
+    if (cpuSlot == kNoRoute) {
+        st = msg.send(conn, sessionHandle, static_cast<uint8_t>(TagService::Write),
+                      path, pathLen, wdata, wdataLen, timeoutMs);
+    } else {
+        st = msg.sendRouted(conn, sessionHandle, cpuSlot, static_cast<uint8_t>(TagService::Write),
+                            path, pathLen, wdata, wdataLen, timeoutMs);
+    }
     if (st != Status::Pending) {
         return st;
     }
