@@ -54,6 +54,10 @@ Status PlcClient::disconnect() {
     return Status::Ok;
 }
 
+void PlcClient::setCpuSlot(uint8_t slot) {
+    cpuSlot_ = slot;
+}
+
 Status PlcClient::poll() {
     switch (state_) {
         case State::Ethernet: {
@@ -203,7 +207,7 @@ Status PlcClient::read(int handle, uint32_t timeoutMs) {
         return Status::Busy;  // single in-flight: one tag operation at a time
     }
     return tags_[handle].read(msg_, tcp_, session_.handle(), tagNames_[handle],
-                              tagElemCount_[handle], timeoutMs);
+                              tagElemCount_[handle], timeoutMs, cpuSlot_);
 }
 
 Status PlcClient::write(int handle, uint32_t timeoutMs) {
@@ -217,7 +221,7 @@ Status PlcClient::write(int handle, uint32_t timeoutMs) {
         return Status::Busy;  // single in-flight: one tag operation at a time
     }
     return tags_[handle].write(msg_, tcp_, session_.handle(), tagNames_[handle],
-                               tagElemCount_[handle], timeoutMs);
+                               tagElemCount_[handle], timeoutMs, cpuSlot_);
 }
 
 Status PlcClient::tagStatus(int handle) const {

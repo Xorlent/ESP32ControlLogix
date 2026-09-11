@@ -81,6 +81,12 @@ public:
     // Begin a graceful disconnect (UnregisterSession + close).
     Status disconnect();
 
+    // Route tag read/write through the backplane to the CPU in `slot` (0..16).
+    // Use this when connecting to a ControlLogix Ethernet module (e.g. 1756-EN2T)
+    // rather than the controller's own embedded EtherNet/IP port. Pass kNoRoute
+    // (the default) for direct access with no route.
+    void setCpuSlot(uint8_t slot);
+
     // --- Tag registry (bounded) ---
 
     // Allocate a tag for the named symbolic tag. elementCount defaults to 1
@@ -146,6 +152,9 @@ private:
     bool wantConnect_ = false;
     uint32_t connectTimeoutMs_ = 0;
     uint32_t deadline_ = 0;
+
+    // Backplane route target for tag I/O (kNoRoute = direct, 0..16 = CPU slot).
+    uint8_t cpuSlot_ = kNoRoute;
 
     // Bounded tag pool.
     Tag tags_[kMaxTags];
