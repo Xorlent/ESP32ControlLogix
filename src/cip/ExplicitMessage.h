@@ -67,6 +67,10 @@ public:
     // Response accessors (valid once poll() returns Ok).
     uint8_t replyService() const { return replyService_; }
     uint8_t resultCode() const { return resultCode_; }
+    // Additional (extended) status: number of 16-bit words and a pointer to
+    // them (nullptr when absent). Useful for detailing a non-zero resultCode().
+    uint8_t additionalStatusSize() const { return addStatusWords_; }
+    const uint8_t *additionalStatus() const { return addStatusWords_ ? addStatus_ : nullptr; }
     const uint8_t *data() const { return data_; }
     size_t dataLength() const { return dataLen_; }
 
@@ -98,6 +102,8 @@ private:
     // Parsed response.
     uint8_t replyService_ = 0;
     uint8_t resultCode_ = 0;
+    uint8_t addStatusWords_ = 0;         // additional (extended) status word count
+    const uint8_t *addStatus_ = nullptr; // pointer to additional status bytes
     const uint8_t *data_ = nullptr;
     size_t dataLen_ = 0;
 

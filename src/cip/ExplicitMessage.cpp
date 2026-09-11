@@ -253,11 +253,19 @@ Status ExplicitMessage::parseResponse() {
         return Status::Error;
     }
 
-    // CIP response: reply service, reserved, general status, ext status size.
+    // CIP response: reply service, reserved, general status, ext status size
+    // (16-bit words), then additional status, then the response data.
     replyService_ = cipData[0];
     resultCode_ = cipData[2];
-    data_ = cipData + 4;
-    dataLen_ = cipLen - 4;
+    addStatusWords_ = cipData[3];
+    addStatus_ = cipData + 4;
+    size_t addBytes = size_t(addStatusWords_) * 2;
+    if (addBytes > cipLen - 4) {           // bounds-check a malformed count
+        addBytes = cipLen - 4;
+        addStatusWords_ = uint8_t(addBytes / 2);
+    }
+    data_ = cipData + 4 + addBytes;
+    dataLen_ = cipLen - 4 - addBytes;
 
     return Status::Ok;
 }

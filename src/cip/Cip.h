@@ -198,6 +198,47 @@ inline size_t appendBackplaneRoute(uint8_t *out, uint8_t slot) {
     return 4;
 }
 
+// Sentinel CPU-slot value meaning "no backplane route" (talk directly to the
+// controller's own EtherNet/IP port). A value 0..16 routes tag messages through
+// the backplane to the CPU in that slot (needed when connecting via a 1756-EN2T
+// or similar Ethernet module).
+constexpr uint8_t kNoRoute = 0xFF;
+
+// Append a CIP port segment (e.g. backplane, port = 1) with an 8-bit link
+// address (e.g. the CPU slot). The port segment is the first hop of a connection
+// path that routes to a module on the backplane. Returns bytes written (2).
+inline size_t appendPortSegment(uint8_t *out, uint8_t port, uint8_t linkAddress) {
+    out[0] = port & 0x0F;   // port segment, 1-byte link (bits[3:0] = port id)
+    out[1] = linkAddress;   // 8-bit link address (e.g. slot number)
+    return 2;
+}
+
+// Decode a CIP SHORT_STRING (a one-byte length prefix followed by that many
+// characters) into a NUL-terminated output buffer. Returns the number of bytes
+// copied, excluding the terminator (0 if empty or invalid). This is the wire
+// format of the Identity object's Product Name (attr 7) and other SHORT_STRING
+// attributes. Bounded: never reads past srcLen or writes past dstCap, and
+// trusts the declared length only up to the bytes actually available
+// (min(declared, available)).
+inline size_t decodeShortString(char *dst, size_t dstCap, const uint8_t *src, size_t srcLen) {
+    if (dst == nullptr || dstCap == 0) {
+        return 0;
+    }
+    dst[0] = 0;
+    if (src == nullptr || srcLen < 1) {
+        return 0;
+    }
+    size_t declared = src[0];     // SHORT_STRING length byte (0..255)
+    size_t avail = srcLen - 1;    // bytes after the length prefix
+    size_t n = (declared < avail) ? declared : avail;
+    if (n > dstCap - 1) {
+        n = dstCap - 1;
+    }
+    memcpy(dst, src + 1, n);
+    dst[n] = 0;
+    return n;
+}
+
 // CIP elementary data type codes (Logix Read/Write Tag services).
 enum class DataType : uint8_t {
     Bool = 0xC1,    // boolean, 1 byte

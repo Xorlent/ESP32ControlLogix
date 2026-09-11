@@ -27,8 +27,10 @@ class TcpConnection;
  */
 class Connection {
 public:
-    // Maximum connected CIP payload size (bytes).
-    static constexpr size_t kMaxDataSize = 256;
+    // Maximum connected CIP payload size (bytes). 508 is the legacy Forward Open
+    // ceiling (the standard Logix connected-explicit message size). The tx_/rx_
+    // buffers below are sized encap(24) + connected overhead(22) + this value.
+    static constexpr size_t kMaxDataSize = 508;
 
     Connection() = default;
     ~Connection();
@@ -36,9 +38,10 @@ public:
     Connection(const Connection &) = delete;
     Connection &operator=(const Connection &) = delete;
 
-    // Forward Open for the named symbolic tag.
+    // Forward Open for the named symbolic tag. cpuSlot routes the connection
+    // path through the backplane to that CPU slot (kNoRoute = direct).
     Status open(TcpConnection &conn, uint32_t sessionHandle, const char *tagName,
-                uint32_t timeoutMs);
+                uint32_t timeoutMs, uint8_t cpuSlot = kNoRoute);
 
     // Send a connected CIP request (service + path + data).
     Status send(TcpConnection &conn, uint32_t sessionHandle, uint8_t service,
@@ -51,9 +54,10 @@ public:
     // Advance the state machine.
     Status poll();
 
-    // Connection IDs (valid once open).
-    uint32_t originatorConnectionId() const { return otConnId_; }  // O->T
-    uint32_t targetConnectionId() const { return toConnId_; }      // T->O
+    // Connection IDs (valid once open). otConnId_ holds the O->T ID (assigned
+    // by the target) and toConnId_ holds the T->O ID (assigned by this device).
+    uint32_t originatorConnectionId() const { return otConnId_; }
+    uint32_t targetConnectionId() const { return toConnId_; }
 
     // True once the connection is open.
     bool isOpen() const { return state_ == State::Open; }
@@ -79,10 +83,12 @@ private:
     TcpConnection *conn_ = nullptr;
     State state_ = State::Idle;
 
-    uint32_t otConnId_ = 0;   // originator -> target connection ID
-    uint32_t toConnId_ = 0;   // target -> originator connection ID
+    uint32_t otConnId_ = 0;   // O->T connection ID (assigned by the target)
+    uint32_t toConnId_ = 0;   // T->O connection ID (assigned by this device)
     uint16_t sequence_ = 1;   // connected sequence number
+    uint16_t connSerial_ = 0; // connection serial number (Forward Open/Close)
     char tagName_[64] = {};   // tag name (for Forward Close)
+    uint8_t cpuSlot_ = kNoRoute;  // route target for the connection path
 
     // Connected (SendUnitData) transmit/receive buffers. The connected body
     // overhead is 22 bytes: interface handle (4) + timeout (2) + item count (2)
@@ -105,11 +111,14 @@ private:
     uint16_t sentSequence_ = 0;
 
     Status startOpen(TcpConnection &conn, uint32_t sessionHandle, const char *tagName,
-                     uint32_t timeoutMs);
+                     uint32_t timeoutMs, uint8_t cpuSlot);
     Status startSend(TcpConnection &conn, uint32_t sessionHandle, uint8_t service,
                      const uint8_t *path, size_t pathLen,
                      const uint8_t *data, size_t dataLen, uint32_t timeoutMs);
     Status startClose(TcpConnection &conn, uint32_t sessionHandle, uint32_t timeoutMs);
+    // Encode the connection path (route + Message Router + symbolic tag, or just
+    // the symbolic tag when direct). Returns bytes written (a whole number of words).
+    size_t buildConnectionPath(uint8_t *out, const char *tagName) const;
     Status pollOpening();
     Status pollSending();
     Status pollClosing();

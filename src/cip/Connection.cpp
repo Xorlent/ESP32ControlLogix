@@ -2,25 +2,56 @@
 
 #include <Arduino.h>
 #include <esp_random.h>
+#include <esp_mac.h>
 #include <string.h>
 
 #include "../transport/TcpConnection.h"
 
 namespace clx {
 
+// Originator identity for Forward Open/Close. The vendor ID must not be
+// Rockwell's reserved 0x0001 (this is not a Rockwell device); it is a
+// non-reserved placeholder for a hobbyist/private device.
+constexpr uint16_t kOriginatorVendorId = 0xF33D;
+
+// Fallback originator serial when the device MAC is unavailable (or all-zero).
+constexpr uint32_t kOriginatorSerialFallback = 0x11223344;
+
+// Originator serial number (32-bit): derived from the low 4 bytes of the base
+// MAC so multiple ESP32s on one network get distinct CIP identities. Cached;
+// falls back to a stable constant if the MAC is unavailable or all-zero.
+static uint32_t originatorSerialNumber() {
+    static uint32_t serial = 0;
+    if (serial != 0) {
+        return serial;
+    }
+    uint8_t mac[6] = {0, 0, 0, 0, 0, 0};
+    if (esp_efuse_mac_get_default(mac) == ESP_OK) {
+        uint32_t v = uint32_t(mac[2]) | (uint32_t(mac[3]) << 8) |
+                     (uint32_t(mac[4]) << 16) | (uint32_t(mac[5]) << 24);
+        if (v != 0) {
+            serial = v;
+        }
+    }
+    if (serial == 0) {
+        serial = kOriginatorSerialFallback;
+    }
+    return serial;
+}
+
 Connection::~Connection() {
     state_ = State::Idle;
 }
 
 Status Connection::open(TcpConnection &conn, uint32_t sessionHandle, const char *tagName,
-                       uint32_t timeoutMs) {
+                       uint32_t timeoutMs, uint8_t cpuSlot) {
     if (tagName == nullptr || strlen(tagName) >= sizeof(tagName_)) {
         return Status::InvalidArg;
     }
     if (state_ == State::Opening || state_ == State::Sending || state_ == State::Closing) {
         return Status::Busy;
     }
-    return startOpen(conn, sessionHandle, tagName, timeoutMs);
+    return startOpen(conn, sessionHandle, tagName, timeoutMs, cpuSlot);
 }
 
 Status Connection::send(TcpConnection &conn, uint32_t sessionHandle, uint8_t service,
@@ -39,16 +70,40 @@ Status Connection::close(TcpConnection &conn, uint32_t sessionHandle, uint32_t t
     return startClose(conn, sessionHandle, timeoutMs);
 }
 
-Status Connection::startOpen(TcpConnection &conn, uint32_t sessionHandle, const char *tagName,
-                             uint32_t timeoutMs) {
-    // Choose a random originator->target connection ID (non-zero).
-    otConnId_ = esp_random();
-    if (otConnId_ == 0) {
-        otConnId_ = 1;
+// Encode the connection path. When routed (cpuSlot_ != kNoRoute), prepend the
+// backplane route to the CPU followed by the Message Router (class 2, instance 1);
+// when direct, the path is just the symbolic tag segment. Returns bytes written.
+size_t Connection::buildConnectionPath(uint8_t *out, const char *tagName) const {
+    size_t total = 0;
+    if (cpuSlot_ != kNoRoute) {
+        total += appendPortSegment(out + total, 1, cpuSlot_);  // backplane -> CPU slot
+        total += appendClass(out + total, 2);                   // class 2 = Message Router
+        total += appendInstance(out + total, 1);                // instance 1
     }
-    toConnId_ = 0;
+    total += appendSymbolic(out + total, tagName);              // symbolic tag
+    return total;
+}
+
+Status Connection::startOpen(TcpConnection &conn, uint32_t sessionHandle, const char *tagName,
+                             uint32_t timeoutMs, uint8_t cpuSlot) {
+    // Choose a random target->originator connection ID (non-zero). Per CIP,
+    // the originator assigns the T->O connection ID (we consume T->O data)
+    // and the target assigns the O->T connection ID, returning it in the
+    // Forward Open response. The O->T ID is therefore left at 0 in the request.
+    toConnId_ = esp_random();
+    if (toConnId_ == 0) {
+        toConnId_ = 1;
+    }
+    otConnId_ = 0;
     strncpy(tagName_, tagName, sizeof(tagName_) - 1);
     tagName_[sizeof(tagName_) - 1] = 0;
+    cpuSlot_ = cpuSlot;
+
+    // Incrementing connection serial (process-wide) so the target can
+    // distinguish sequential/reopened connections from the same originator.
+    static uint16_t s_connSerial = 0;
+    if (++s_connSerial == 0) ++s_connSerial;  // skip 0
+    connSerial_ = s_connSerial;
 
     // Request path to the Connection Manager (class 6, instance 1).
     const uint8_t reqPath[4] = {0x20, 0x06, 0x24, 0x01};
@@ -58,22 +113,27 @@ Status Connection::startOpen(TcpConnection &conn, uint32_t sessionHandle, const 
     size_t d = 0;
     data[d++] = 0x0A;                          // priority/tick time
     data[d++] = 0x0E;                          // timeout ticks
-    putU32(data + d, otConnId_); d += 4;       // O->T connection ID
-    putU32(data + d, 0); d += 4;               // T->O connection ID (0)
-    putU16(data + d, 1); d += 2;               // connection serial number
-    putU16(data + d, 0x0001); d += 2;          // originator vendor ID
-    putU32(data + d, 0x00000001); d += 4;      // originator serial number
+    putU32(data + d, 0); d += 4;               // O->T connection ID (0; target assigns)
+    putU32(data + d, toConnId_); d += 4;       // T->O connection ID (ours)
+    putU16(data + d, connSerial_); d += 2;               // connection serial number
+    putU16(data + d, kOriginatorVendorId); d += 2;       // originator vendor ID
+    putU32(data + d, originatorSerialNumber()); d += 4;  // originator serial number
     data[d++] = 0x03;                          // connection timeout multiplier
     data[d++] = 0; data[d++] = 0; data[d++] = 0;  // reserved (3)
+    // Network connection params (O->T / T->O): 0x4200 = "variable size" Class 3
+    // flags; OR in our connected payload capacity (bytes) so the target sees a
+    // concrete max. Matches libplctag's AB_EIP_CONN_PARAM | max_payload_guess.
+    const uint16_t connParams = uint16_t(0x4200u | kMaxDataSize);
     putU32(data + d, 10000); d += 4;           // O->T RPI (us)
-    putU16(data + d, 0x4200); d += 2;          // O->T network params
+    putU16(data + d, connParams); d += 2;      // O->T network params
     putU32(data + d, 10000); d += 4;           // T->O RPI (us)
-    putU16(data + d, 0x4200); d += 2;          // T->O network params
+    putU16(data + d, connParams); d += 2;      // T->O network params
     data[d++] = 0xA3;                          // transport type/trigger (class 3)
 
-    // Connection path (symbolic tag). Use the truncated tagName_ (not the
+    // Connection path (backplane route -> Message Router -> symbolic tag, or
+    // just the symbolic tag when direct). Use the truncated tagName_ (not the
     // caller's tagName) so a long name cannot overflow the data buffer.
-    size_t pathLen = appendSymbolic(data + d + 1, tagName_);
+    size_t pathLen = buildConnectionPath(data + d + 1, tagName_);
     data[d] = uint8_t(pathLen / 2);            // connection path size (words)
     d += 1 + pathLen;
 
@@ -88,16 +148,23 @@ Status Connection::startOpen(TcpConnection &conn, uint32_t sessionHandle, const 
 Status Connection::startClose(TcpConnection &conn, uint32_t sessionHandle, uint32_t timeoutMs) {
     const uint8_t reqPath[4] = {0x20, 0x06, 0x24, 0x01};
 
+    // Forward Close request data (matching the Forward Open identity):
+    // priority/tick (1) + timeout ticks (1) + connection serial (2) +
+    // originator vendor ID (2) + originator serial (4) + path size (1) +
+    // reserved (1) + connection path.
     uint8_t data[128];
-    size_t pathLen = appendSymbolic(data + 1, tagName_);
-    data[0] = uint8_t(pathLen / 2);  // connection path size (words)
-    size_t d = 1 + pathLen;
+    size_t d = 0;
+    data[d++] = 0x0A;                          // priority/tick time
+    data[d++] = 0x0E;                          // timeout ticks
+    putU16(data + d, connSerial_); d += 2;               // connection serial number
+    putU16(data + d, kOriginatorVendorId); d += 2;       // originator vendor ID
+    putU32(data + d, originatorSerialNumber()); d += 4;  // originator serial number
 
-    // Forward Close also carries the connection identity (matching Forward
-    // Open) so the target can identify the connection being closed.
-    putU16(data + d, 1); d += 2;               // connection serial number
-    putU16(data + d, 0x0001); d += 2;          // originator vendor ID
-    putU32(data + d, 0x00000001); d += 4;      // originator serial number
+    // Connection path (matches Forward Open).
+    size_t pathLen = buildConnectionPath(data + d + 2, tagName_);
+    data[d] = uint8_t(pathLen / 2);            // connection path size (words)
+    data[d + 1] = 0;                           // reserved
+    d += 2 + pathLen;
 
     Status st = fwd_.send(conn, sessionHandle, 0x4E, reqPath, sizeof(reqPath), data, d, timeoutMs);
     if (st != Status::Pending) {
@@ -191,18 +258,18 @@ Status Connection::pollOpening() {
         return Status::Error;
     }
     // Forward Open response: O->T conn ID (4), T->O conn ID (4), serial (2), vendor (2).
-    uint32_t ot = getU32(fwd_.data());
-    uint32_t to = getU32(fwd_.data() + 4);
+    uint32_t ot = getU32(fwd_.data());        // O->T ID assigned by the target
+    uint32_t to = getU32(fwd_.data() + 4);    // T->O ID echoed back (ours)
     if (ot == 0 || to == 0) {
         state_ = State::Failed;
         return Status::Error;
     }
-    // The target echoes our O->T ID and supplies the T->O ID.
-    if (ot != otConnId_) {
+    // The target echoes our T->O ID and supplies the O->T ID.
+    if (to != toConnId_) {
         state_ = State::Failed;
-        return Status::Error;  // mismatched O->T connection ID
+        return Status::Error;  // mismatched T->O connection ID (echo)
     }
-    toConnId_ = to;
+    otConnId_ = ot;  // save the target-assigned O->T ID (used in SendUnitData)
     state_ = State::Open;
     return Status::Ok;
 }
