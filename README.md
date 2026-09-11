@@ -9,10 +9,10 @@ A lightweight, non-blocking EtherNet/IP and CIP (Common Industrial Protocol) cli
 
 Not yet validated against real ControlLogix hardware (or not implemented):
 
-- **Symbolic tag read/write** — Unconnected `Tag`/`PlcClient` path (`Read Tag`/`Write Tag`) and the connected `Connection` path (`Forward Open`/`SendUnitData`)
-- **Backplane routing for tag I/O** — tag reads/writes do not yet route through the backplane to the CPU (slot 0); only `ExplicitMessage::sendRouted()` (used by the IdentityQuery, LanInventory, and ListTags examples) does.
+- **Symbolic tag read/write** — Connected `Connection` path (`Forward Open`/`SendUnitData`) currently unsupported.
 - **Program-scoped tags** — `ListTags` enumerates controller-scope tags only; `Program:`-prefixed access is currently unsupported.
-- **Arrays, structs, and user-defined types** — not supported/decoded.
+- **Arrays, structs, and user-defined types** — not supported.
+- **Connected mode** — not yet supported.
 
 ## Table of Contents
 
@@ -51,7 +51,6 @@ Not yet validated against real ControlLogix hardware (or not implemented):
 - **Callbacks** : Optional tag-completion and connection-state callbacks for event-driven integration.
 - **Reconnect & Recovery** : Handles timeouts, disconnects, stale responses, and PLC restarts.
 - **Transport-Independent** : Session and CIP logic are decoupled from the underlying transport (Wi-Fi or Ethernet).
-- **Testable** : Includes a host-side Python-based synthetic EtherNet/IP server for validation without hardware.
 
 ## Supported Data Types
 
@@ -75,7 +74,7 @@ Typed accessors are provided for the following Logix elementary data types:
 ## Requirements
 
 - **Hardware** : Any ESP32-family board. The default configuration targets the M5Stack AtomS3 with the AtomPoE (W5500) shield, but other SPI or RMII Ethernet PHYs (e.g. LAN8720) are supported.
-- **Board Library** : Arduino-ESP32 3.3.11
+- **Board Library** : Arduino-ESP32 3.3.x
 - **Network** : Static IPv4 configuration is provided by the sketch. A ControlLogix PLC (or the synthetic server) listening on port 44818.
 
 ## Installation
@@ -368,6 +367,10 @@ size_t appendAttribute(uint8_t *out, uint8_t attributeId); // 8-bit attribute se
 size_t appendSymbolic(uint8_t *out, const char *name);   // symbolic tag segment
 size_t appendBackplaneRoute(uint8_t *out, uint8_t slot); // backplane route (port 1, link = slot)
 
+// Decode a CIP SHORT_STRING (1-byte length prefix + chars) into a NUL-terminated
+// buffer; returns chars copied. Use for Identity "Product Name" (attr 7), etc.
+size_t decodeShortString(char *dst, size_t dstCap, const uint8_t *src, size_t srcLen);
+
 size_t      dataTypeElementSize(DataType t);
 const char *dataTypeName(DataType t);
 ```
@@ -450,7 +453,7 @@ Key design goals:
 ## Limitations
 
 - **Bounded tag pool** : `kMaxTags` (default 8) simultaneous tags; `createTag()` returns `NoMemory` when exhausted. Override via `ESP32_CONTROLLOGIX_MAX_TAGS`.
-- **Bounded buffer** : Tag data is capped at 256 bytes
+- **Bounded buffer** : Tag data is capped at 508 bytes
 - **Single in-flight** : Only one tag read/write runs at a time (no pipelining). `read()`/`write()` return `Busy` while another operation is in flight.
 - **Static IP** : The current transport targets static IPv4 configuration; DHCP is not yet wired into the public API.
 
@@ -500,6 +503,7 @@ plc.read(handles[0], 5000);   // start the first; the callback chains the rest
 
 ## Version History
 
+- **0.1.4** : Fix forward open connection IDs. Fix malformed forward close, addressed missing `priority/tick` + `timeout_ticks`.  Feature: backplane routing now supported/working.
 - **0.1.3** : Fix the symbolic tag segment encoding (`0x91` "extended symbol" vs. `0xA0` "constructed data type") and the `Get Attribute Single` request (the attribute is a path segment, keeping the path-size word correct); add Symbol Object (class `0x6B`) tag enumeration via `Get Instance Attribute List` (`0x55`) with `kSymbolClass`, symbol attribute IDs, and `appendInstance16`/`appendInstance32` helpers; enlarge the explicit-message buffer to accept a full 502-byte UCMM response; add the `ListTags` example and correct `LanInventory` run-switch/state reporting.
 - **0.1.2** : Add backplane routing (`ExplicitMessage::sendRouted()`) to reach the CPU (slot 0) or other modules when connected through a ControlLogix Ethernet module; add `appendBackplaneRoute()`, `kConnectionManagerClass`, and `kUnconnectedSend` CIP helpers; align the SendRRData timeout field with the reference implementation.
 - **0.1.1** : Enforce a single in-flight tag operation (`read()`/`write()` return `Busy` while another is active); `Tag` now takes a shared, caller-supplied `ExplicitMessage`
