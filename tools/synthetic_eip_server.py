@@ -68,7 +68,7 @@ IDENTITY_ATTRIBUTES = {
     4: struct.pack("<BB", 1, 20),      # revision major=1, minor=20
     5: struct.pack("<H", 0),           # status
     6: struct.pack("<I", 0x12345678),  # serial number
-    7: b"Synthetic PLC",               # product name
+    7: bytes([len("Synthetic PLC")]) + b"Synthetic PLC",  # product name (SHORT_STRING: 1-byte length + chars)
     8: struct.pack("<B", 3),           # state = operational
 }
 
@@ -207,13 +207,15 @@ def handle_cip_request(session, service, path, rest):
         print(f"  -> Write Tag {name}: bad request")
         return bytes([WRITE_TAG_REPLY, 0, 0x04, 0])
     if service == FORWARD_OPEN:
-        # rest = [priority/tick (1)][timeout ticks (1)][O->T conn ID (4)][T->O conn ID (4)][...]
-        if len(rest) >= 6:
-            ot = struct.unpack("<I", rest[2:6])[0]
-            to = 0x10203040
-            connections[session] = {"ot": ot, "to": to}
-            print(f"  -> Forward Open: O->T=0x{ot:08X} T->O=0x{to:08X}")
-            return bytes([FORWARD_OPEN_REPLY, 0, 0, 0]) + struct.pack("<IIHH", ot, to, 1, 0x0001)
+        # rest = [priority/tick (1)][timeout ticks (1)][O->T conn ID (4) = 0][T->O conn ID (4)][...]
+        # Per CIP, the client sends O->T = 0 and its own T->O ID; the server
+        # assigns the O->T ID and echoes the client's T->O ID.
+        if len(rest) >= 10:
+            client_to = struct.unpack("<I", rest[6:10])[0]
+            server_ot = 0x10203040
+            connections[session] = {"ot": server_ot, "to": client_to}
+            print(f"  -> Forward Open: O->T=0x{server_ot:08X} T->O=0x{client_to:08X}")
+            return bytes([FORWARD_OPEN_REPLY, 0, 0, 0]) + struct.pack("<IIHH", server_ot, client_to, 1, 0x0001)
         print("  -> Forward Open: bad request")
         return bytes([FORWARD_OPEN_REPLY, 0, 0x04, 0])
     if service == FORWARD_CLOSE:
